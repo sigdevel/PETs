@@ -7,7 +7,7 @@ echo "
  / ____/  / /___    / /     (__  ) 
 /_/      /_____/   /_/     /____/  
 
-Description: This script is a basic automation of initial map exploration with Proxmark3 - it performs tasks such as reading map information, checking keys, performing attacks (e.g. darkside, nested, hardnested) and map emulation. All logs are saved in a specified directory and archived for easy further analysis.
+Description: This script is a basic automation of initial map exploration with Proxmark3 - it performs tasks such as reading map information, checking keys, performing attacks (e.g. darkside, nested, hardnested) and map emulation for hight-frequency RFID cards. All logs are saved in a specified directory and archived for easy further analysis.
 Author: @sigdevel
 Version: 1.0
 Created: 01-01-2025
@@ -23,6 +23,10 @@ TIMESTAMP=$(date +"%d%m%Y_%H%M%S")
 ARCHIVE_NAME="/home/$USER/hf-mf-logs-${TIMESTAMP}.tar.gz"
 LOG_FILE="${LOG_DIR}/output.log"
 
+# Значение ключа по умолчанию
+DEFAULT_KEY="FFFFFFFFFFFF"
+CURRENT_KEY="$DEFAULT_KEY"
+
 if [ -d "$LOG_DIR" ]; then
     echo "Директория $LOG_DIR существует. Очищаем содержимое..." | tee -a "$LOG_FILE"
     rm -rf "${LOG_DIR}"/* | tee -a "$LOG_FILE"
@@ -31,28 +35,52 @@ else
     mkdir -p "$LOG_DIR" | tee -a "$LOG_FILE"
 fi
 
-#ф-ция выполнения команды и вывода результата
+# Функция выполнения команды и вывода результата
 run_command() {
     echo "Выполнение команды: $1" | tee -a "$LOG_FILE"
     $PROXMARK3_CLI -c "$1" 2>&1 | tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
 }
 
-#ф-ция извлечения значения из вывода команды
+# Функция извлечения значения из вывода команды
 extract_value() {
     echo "$1" | grep -oP "$2:\s*\K[0-9A-Fa-f ]+"
 }
 
-#получение инфо по карте
+# Функция извлечения ключа из вывода команды
+extract_key() {
+    echo "$1" | grep -oP "found valid key:\s*\K[A-Fa-f0-9]{12}"
+}
+
+# Функция определения типа карты
+determine_card_type() {
+    if echo "$1" | grep -q "MIFARE Classic"; then
+        echo "MIFARE Classic"
+    elif echo "$1" | grep -q "Magic Gen1"; then
+        echo "Magic Gen1"
+    elif echo "$1" | grep -q "Magic Gen3"; then
+        echo "Magic Gen3"
+    elif echo "$1" | grep -q "Magic Gen4 GTU"; then
+        echo "Magic Gen4 GTU"
+    else
+        echo "Unknown"
+    fi
+}
+
+# Получение информации по карте
 echo "Получение информации о карте..." | tee -a "$LOG_FILE"
 INFO=$($PROXMARK3_CLI -c "hf mf info" 2>&1 | tee -a "$LOG_FILE")
 
-#извлечение UID+ATQA+SAK
+# Извлечение UID+ATQA+SAK
 UID=$(extract_value "$INFO" "UID")
 ATQA=$(extract_value "$INFO" "ATQA")
 SAK=$(extract_value "$INFO" "SAK")
 
-#проверка извлечения данных
+# Определение типа карты
+CARD_TYPE=$(determine_card_type "$INFO")
+echo "Тип карты: $CARD_TYPE" | tee -a "$LOG_FILE"
+
+# Проверка извлечения данных
 if [[ -z "$UID" || -z "$ATQA" || -z "$SAK" ]]; then
     echo "Ошибка: не удалось извлечь UID, ATQA или SAK - проверьте контакт с картой" | tee -a "$LOG_FILE"
     exit 1
@@ -65,12 +93,26 @@ echo "" | tee -a "$LOG_FILE"
 
 mf_chk() {
     echo "1. Проверка ключей доступа (chk)..." | tee -a "$LOG_FILE"
-    run_command "hf mf chk"
+    CHK_OUTPUT=$(${PROXMARK3_CLI} -c "hf mf chk" 2>&1 | tee -a "$LOG_FILE")
+    KEY=$(extract_key "$CHK_OUTPUT")
+    if [[ -n "$KEY" ]]; then
+        CURRENT_KEY="$KEY"
+        echo "Найден ключ: $CURRENT_KEY" | tee -a "$LOG_FILE"
+    else
+        echo "Ключ не найден, используется значение по умолчанию: ${CURRENT_KEY}" | tee -a "$LOG_FILE"
+    fi
 }
 
 mf_fchk() {
     echo "2. Проверка ключей (fchk)..." | tee -a "$LOG_FILE"
-    run_command "hf mf fchk"
+    FCHK_OUTPUT=$(${PROXMARK3_CLI} -c "hf mf fchk" 2>&1 | tee -a "$LOG_FILE")
+    KEY=$(extract_key "${FCHK_OUTPUT}")
+    if [[ -n "$KEY" ]]; then
+        CURRENT_KEY="$KEY"
+        echo "Найден ключ: ${CURRENT_KEY}" | tee -a "$LOG_FILE"
+    else
+        echo "Ключ не найден, используется значение по умолчанию: ${CURRENT_KEY}" | tee -a "$LOG_FILE"
+    fi
 }
 
 mf_info() {
@@ -90,7 +132,7 @@ mf_darkside() {
 
 mf_nested() {
     echo "6. Попытка выполнение атаки nested..." | tee -a "$LOG_FILE"
-    NESTED_OUTPUT=$($PROXMARK3_CLI -c "hf mf nested 0 A FFFFFFFFFFFF 1" 2>&1 | tee -a "$LOG_FILE")
+    NESTED_OUTPUT=$(${PROXMARK3_CLI} -c "hf mf nested 0 A ${CURRENT_KEY} 1" 2>&1 | tee -a "$LOG_FILE")
 
     # Извлечение данных из вывода nested
     NT=$(extract_value "$NESTED_OUTPUT" "Tag nonce \(nt\)")
@@ -113,12 +155,12 @@ mf_nested() {
 
 mf_hardnested() {
     echo "7. Попытка выполнение атаки hardnested..." | tee -a "$LOG_FILE"
-    run_command "hf mf hardnested --blk 0 -a -k FFFFFFFFFFFF --tblk 4 --ta"
+    run_command "hf mf hardnested --blk 0 -a -k ${CURRENT_KEY} --tblk 4 --ta"
 }
 
 mf_staticnested() {
     echo "8. Попытка выполнение атаки staticnested..." | tee -a "$LOG_FILE"
-    run_command "hf mf staticnested --1k --blk 0 -a -k FFFFFFFFFFFF"
+    run_command "hf mf staticnested --1k --blk 0 -a -k ${CURRENT_KEY}"
 }
 
 mf_brute() {
@@ -149,13 +191,13 @@ mf_crypto1() {
 mf_rdsc() {
     # Если ключ известен
     echo "13. Попытка чтения данных из сектора 0..." | tee -a "$LOG_FILE"
-    run_command "hf mf rdsc 0 A FFFFFFFFFFFF"
+    run_command "hf mf rdsc 0 A ${CURRENT_KEY}"
 }
 
 mf_wrsc() {
     # Если ключ известен
     echo "14. Попытка записи данных в сектор 0..." | tee -a "$LOG_FILE"
-    run_command "hf mf wrsc 0 A FFFFFFFFFFFF 000102030405060708090A0B0C0D0E0F"
+    run_command "hf mf wrsc 0 A ${CURRENT_KEY} 000102030405060708090A0B0C0D0E0F"
 }
 
 mf_sim() {
@@ -220,9 +262,29 @@ mf_rdsc
 mf_wrsc
 mf_sim
 mifare_ops
-magic_gen1_ops
-magic_gen3_ops
-magic_gen4_ops
+
+# Выполнение операций в зависимости от типа карты
+case "$CARD_TYPE" in
+    "MIFARE Classic")
+        echo "Выполнение операций для MIFARE Classic..." | tee -a "$LOG_FILE"
+        mifare_ops
+        ;;
+    "Magic Gen1")
+        echo "Выполнение операций для Magic Gen1..." | tee -a "$LOG_FILE"
+        magic_gen1_ops
+        ;;
+    "Magic Gen3")
+        echo "Выполнение операций для Magic Gen3..." | tee -a "$LOG_FILE"
+        magic_gen3_ops
+        ;;
+    "Magic Gen4 GTU")
+        echo "Выполнение операций для Magic Gen4 GTU..." | tee -a "$LOG_FILE"
+        magic_gen4_ops
+        ;;
+    *)
+        echo "Неизвестный тип карты. Пропуск специфических операций" | tee -a "$LOG_FILE"
+        ;;
+esac
 
 save_result
 
